@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-verify_state.py — state.md 完整性校验器 (v4.1 — 第四轮审计修补)
+verify_state.py — state.md 完整性校验器 (v5.0 — 遗留兼容组件)
 ==========================================================
 用途：在 Agent 恢复 Checkpoint 之前，代码层强制校验 state.md 的合法性。
 安全声明：本脚本 100% 透明，仅使用 Python 内置库 (sys, os, re, unicodedata)。
 
-v4.1 变更 (第四轮审计修补)：
-  - 新增全文跨行模式检测（re.DOTALL），防拆分注入
-  - TIME/HASH 结构校验统一使用 normalized_content
-  - CHECKPOINT_HASH 增加格式正则校验
-  - 成功报告改为动态生成，与实际校验项同步
+注意：自 OpenClaw 2026.3.12 引入 ContextEngine 插件接口后，推荐使用
+ContextEngine 的自动化上下文管理替代手动 /checkpoint 流程。本校验器保留
+以兼容未使用 ContextEngine 的环境。
+
+v5.0 变更：
+  - 兼容 TokenGuard-v4 和 TokenGuard-v5 两种签名格式
+  - 保留全部 v4.1 安全校验（跨行检测、NFKC、标题层级、OOM 熔断）
 """
 
 import sys
@@ -99,8 +101,9 @@ def verify_state_md(path="state.md"):
 
     # ─── 1. 结构校验：签名区块（统一使用 normalized_content） ───
     struct_ok = True
-    if "CHECKPOINT_CREATED_BY: TokenGuard-v4" not in normalized_content:
-        reasons.append("❌ 结构校验失败: 缺少 CHECKPOINT_CREATED_BY: TokenGuard-v4 签名（必须精确匹配版本号）")
+    if "CHECKPOINT_CREATED_BY: TokenGuard-v4" not in normalized_content and \
+       "CHECKPOINT_CREATED_BY: TokenGuard-v5" not in normalized_content:
+        reasons.append("❌ 结构校验失败: 缺少 CHECKPOINT_CREATED_BY: TokenGuard-v4/v5 签名（必须精确匹配版本号）")
         struct_ok = False
 
     if "CHECKPOINT_TIME:" not in normalized_content:

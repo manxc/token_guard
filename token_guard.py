@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-TokenGuard 🦞 — 本地日志拦截器 (v4 — 红队三轮审计加固版)
+TokenGuard 🦞 — 运行时输出防火墙 (v5.0 — ContextEngine 互补版)
 ==========================================================
-用途：拦截长日志输出，静默写入本地文件，仅向终端打印退出码和最后 N 行摘要。
+用途：在工具输出到达 Agent 之前进行安全净化（提示词注入过滤、Unicode 正规化、
+零宽字符剥离），充当 ContextEngine 的安全前置层。
 安全声明：本脚本 100% 透明，不含任何网络请求、base64 解码或动态 eval() 操作。
-仅使用 Python 内置库 (sys, subprocess, os, re, unicodedata, uuid, shutil)。
+仅使用 Python 内置库 (sys, subprocess, os, re, unicodedata, uuid, shutil, json)。
 
-v4 变更 (红队第三轮审计修补)：
-  - 修复 tail_log() 净化调用退化（v3 回归 Bug）
-  - query_log() 输出前二次净化
-  - 命令黑名单增加软链接解析（shutil.which + os.path.realpath）
-  - --query 关键词长度/字符集校验，防信息泄露
+v5.0 变更 (ContextEngine 互补版)：
+  - 新增 --format json 输出模式，便于 ContextEngine 插件 ingest 钩子消费
+  - 重新定位为运行时输出防火墙，聚焦安全净化而非上下文长度管理
+  - 保留全部 v4.1 安全加固（净化器、黑名单、软链接解析、OOM 熔断）
 """
 
 import sys
@@ -20,6 +20,7 @@ import subprocess
 import unicodedata
 import uuid
 import shutil
+import json
 
 # ─── 配置常量 ───────────────────────────────────────────────────────────
 LOG_DIR = ".claw_logs"
@@ -274,10 +275,27 @@ def query_log(keyword=None, line_range=None):
 
 
 def main():
+    # ─── 解析 --format 参数 ───────────────────────────────────────
+    output_format = "text"
+    filtered_argv = []
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--format" and i + 1 < len(sys.argv):
+            fmt = sys.argv[i + 1].lower()
+            if fmt in ("json", "text"):
+                output_format = fmt
+            else:
+                print(f"[TokenGuard] ⛔ 不支持的输出格式: {fmt}（支持: text, json）")
+                sys.exit(2)
+            i += 2
+        else:
+            filtered_argv.append(sys.argv[i])
+            i += 1
+
     # ─── --query 受控查询模式 ─────────────────────────────────────
-    if len(sys.argv) >= 2 and sys.argv[1] == "--query":
-        if len(sys.argv) >= 3:
-            arg = sys.argv[2]
+    if filtered_argv and filtered_argv[0] == "--query":
+        if len(filtered_argv) >= 2:
+            arg = filtered_argv[1]
             # 尝试解析为行号范围 "10-50"
             range_match = re.match(r'^(\d+)-(\d+)$', arg)
             if range_match:
@@ -287,7 +305,7 @@ def main():
                 if len(arg) > 100:
                     print("[TokenGuard] ⛔ 查询关键词过长（上限 100 字符），已拒绝。")
                     sys.exit(2)
-                if not re.match(r'^[\w\s\.\-\:@/\\\[\]\(\)\{\}#=+,;!?*&^%$"\',]+$', arg):
+                if not re.match(r'^[\w\s\.\-\:@/\\\[\]\(\)\{\}#=+,;!?*&^%$"\']+$', arg):
                     print("[TokenGuard] ⛔ 查询关键词包含非法字符，已拒绝。")
                     sys.exit(2)
                 query_log(keyword=arg)
@@ -296,38 +314,73 @@ def main():
         sys.exit(0)
 
     # ─── 参数校验 ────────────────────────────────────────────────────
-    if len(sys.argv) < 2:
+    if not filtered_argv:
         print("用法:")
-        print("  执行命令:  python token_guard.py <command> [args...]")
+        print("  执行命令:  python token_guard.py [--format json|text] <command> [args...]")
         print("  查询日志:  python token_guard.py --query <keyword|start-end>")
         print("")
         print("示例:")
         print("  python token_guard.py npm install")
+        print("  python token_guard.py --format json npm run build")
         print("  python token_guard.py --query error")
         print("  python token_guard.py --query 10-50")
         sys.exit(1)
 
-    cmd_args = sys.argv[1:]
+    cmd_args = filtered_argv
 
     # ─── 命令黑名单校验 ──────────────────────────────────────────────
     validate_command(cmd_args)
 
     # ─── 执行命令 ────────────────────────────────────────────────────
-    print(f"[TokenGuard] 🦞 正在静默执行: {' '.join(cmd_args)}")
-    print(f"[TokenGuard] 净化日志: {os.path.abspath(LOG_FILE)}")
-    print(f"[TokenGuard] 原文日志: {os.path.abspath(RAW_LOG_FILE)} (仅供人工审阅)")
-    print("-" * 60)
+    if output_format == "text":
+        print(f"[TokenGuard] 🦞 正在静默执行: {' '.join(cmd_args)}")
+        print(f"[TokenGuard] 净化日志: {os.path.abspath(LOG_FILE)}")
+        print(f"[TokenGuard] 原文日志: {os.path.abspath(RAW_LOG_FILE)} (仅供人工审阅)")
+        print("-" * 60)
 
     exit_code = run_command(cmd_args)
 
+    # ─── 统计净化行数 ─────────────────────────────────────────────
+    sanitized_count = 0
+    total_lines = 0
+    if os.path.isfile(LOG_FILE):
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                total_lines += 1
+                if line.strip() == "[TG:BLOCKED]":
+                    sanitized_count += 1
+
     # ─── 输出摘要 ────────────────────────────────────────────────────
-    print("=" * 60)
-    print(f"[TokenGuard] ✅ Exit Code: {exit_code}")
-    print("=" * 60)
-    print(tail_log(TAIL_LINES))
-    print("=" * 60)
-    print(f"[TokenGuard] 📄 净化日志: {os.path.abspath(LOG_FILE)}")
-    print(f"[TokenGuard] 📄 原文日志: {os.path.abspath(RAW_LOG_FILE)} (⚠️ Agent 禁止直接读取)")
+    if output_format == "json":
+        # 结构化 JSON 输出，便于 ContextEngine 插件 ingest 钩子消费
+        tail_content = tail_log(TAIL_LINES)
+        tail_lines_list = []
+        if tail_content and not tail_content.startswith("[TokenGuard]"):
+            for line in tail_content.splitlines():
+                if not line.startswith("# [TG:UNTRUSTED-"):
+                    tail_lines_list.append(line)
+
+        result = {
+            "tokenguard_version": "5.0",
+            "command": " ".join(cmd_args),
+            "exit_code": exit_code,
+            "total_lines": total_lines,
+            "sanitized_lines": sanitized_count,
+            "tail_lines": tail_lines_list,
+            "log_file": os.path.abspath(LOG_FILE),
+            "raw_log_file": os.path.abspath(RAW_LOG_FILE),
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print("=" * 60)
+        print(f"[TokenGuard] ✅ Exit Code: {exit_code}")
+        if sanitized_count > 0:
+            print(f"[TokenGuard] 🛡️ 已净化 {sanitized_count} 行可疑内容")
+        print("=" * 60)
+        print(tail_log(TAIL_LINES))
+        print("=" * 60)
+        print(f"[TokenGuard] 📄 净化日志: {os.path.abspath(LOG_FILE)}")
+        print(f"[TokenGuard] 📄 原文日志: {os.path.abspath(RAW_LOG_FILE)} (⚠️ Agent 禁止直接读取)")
 
     sys.exit(exit_code)
 
